@@ -16,12 +16,15 @@ class PawnMowerState:
     board: Board
     remaining_black_pawns: FrozenSet[Position]
     active_piece: Optional[str] = None
-    active_origin_position: Optional[Tuple[int, int]] = None
+    # active_origin_position: fora do hash/compare tal como move_count.
+    # A origem da peca activa nao faz parte da identidade do estado --
+    # apenas serve para calcular a celula vazia em _cell_at.
+    # Se ficasse no hash, dois estados identicos (mesma peca, mesma posicao,
+    # mesmos peoes) teriam hashes diferentes apos capturas encadeadas,
+    # desactivando a deteccao de ciclos e permitindo loops infinitos.
+    active_origin_position: Optional[Tuple[int, int]] = field(
+        default=None, hash=False, compare=False
+    )
     active_position: Optional[Tuple[int, int]] = None
     king_position: Optional[Tuple[int, int]] = None
-    # move_count fora do hash: nao faz parte da identidade do estado.
-    # O A* usa best_g para evitar ciclos — visited_positions foi REMOVIDO
-    # porque causava pruning incorreto: estados com menos visited (mais
-    # liberdade) eram descartados a favor de estados com custo menor mas
-    # mais visited (menos liberdade), bloqueando solucoes validas.
     move_count: int = field(default=0, hash=False, compare=False)
