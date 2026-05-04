@@ -23,7 +23,7 @@ KING_DELTAS = (
 )
 
 
-# ── Estado inicial ───────────────────────────────────────────────────────────
+# ── Estado inicial ────────────────────────────────────────────────────────────
 
 def build_initial_state(board):
     return PawnMowerState(
@@ -37,13 +37,13 @@ def build_initial_state(board):
     )
 
 
-# ── Objectivo ────────────────────────────────────────────────────────────────
+# ── Objectivo ─────────────────────────────────────────────────────────────────
 
 def is_goal(state):
     return not state.remaining_black_pawns
 
 
-# ── Heurística (MST de Chebyshev) ────────────────────────────────────────────
+# ── Heurística (MST de Chebyshev) ─────────────────────────────────────────────
 
 def _chebyshev(a, b):
     return max(abs(a[0] - b[0]), abs(a[1] - b[1]))
@@ -104,11 +104,10 @@ def heuristic(state):
     return float(mst + nearest + 1.0)
 
 
-# ── Célula efectiva (considera estado dinâmico) ──────────────────────────────
+# ── Célula efectiva (considera estado dinâmico) ───────────────────────────────
 
 def _cell_at(state, row, col):
     pos = (row, col)
-    # CRÍTICO: guard is not None antes de comparar com king_position
     if state.king_position is not None and pos == state.king_position:
         return 'R'
     if state.active_piece is not None and pos == state.active_position:
@@ -136,9 +135,6 @@ def _activate_piece(state, position, symbol):
 
 
 def _capture_with_active(state, destination):
-    # CRÍTICO: actualizar active_origin_position para o destino da captura.
-    # Sem isto, a casa de origem original continua a aparecer como vazia
-    # em _cell_at, gerando acções inválidas nas capturas seguintes.
     return replace(
         state,
         active_position=destination,
@@ -164,7 +160,7 @@ def _move_king_step(state, destination):
     return replace(state, king_position=destination, move_count=state.move_count + 1)
 
 
-# ── Ordenação dos sucessores pela heurística MST completa ────────────────────
+# ── Ordenação dos sucessores ───────────────────────────────────────────────────
 
 def _succ_key(item):
     _, nxt, _ = item
@@ -179,7 +175,7 @@ def successors(state):
 
     board = state.board
 
-    # ── MODO 0: activar uma peça branca do tabuleiro ─────────────────────────
+    # ── MODO 0: activar uma peça branca do tabuleiro ──────────────────────────
     if state.active_piece is None and state.king_position is None:
         results = []
         for row, col, symbol in _all_white_positions(board):
@@ -188,7 +184,7 @@ def successors(state):
         results.sort(key=_succ_key)
         return results
 
-    # ── MODO 2: drone em modo rei (a andar entre peças) ───────────────────────
+    # ── MODO 2: drone em modo rei ─────────────────────────────────────────────
     if state.king_position is not None:
         results = []
         row_k, col_k = state.king_position
@@ -202,9 +198,6 @@ def successors(state):
             if cell == ' ':
                 results.append((sq, _move_king_step(state, dest), 1.0))
             elif cell in WHITE_PIECES:
-                # CORRIGIDO: sem "cell != 'R'" — Torres do board são 'R'
-                # e devem ser activáveis. O rei dinâmico está em
-                # king_position e nunca aparece numa casa adjacente.
                 results.append((sq, _activate_piece(state, dest, cell), 1.0))
         results.sort(key=_succ_key)
         return results
@@ -227,26 +220,20 @@ def successors(state):
         captures.sort(key=_succ_key)
         return captures
 
-    # Sem capturas: sair da peça activa (1 passo de rei adjacente)
+    # Sem capturas: sair para modo rei — APENAS casas vazias adjacentes.
+    # Activar peça branca adjacente requer SEMPRE 2 acções separadas:
+    # (1) _enter_king_mode para a casa da peça  → Modo 2
+    # (2) _activate_piece a partir do Modo 2    → Modo 1
+    # Fazer em 1 acção seria fisicamente inválido e geraria soluções falsas.
     exit_results = []
     row_a, col_a = apos
     for d_row, d_col in KING_DELTAS:
         nr, nc = row_a + d_row, col_a + d_col
         if not board.in_bounds(nr, nc):
             continue
-        dest = (nr, nc)
-        cell = _cell_at(state, nr, nc)
-        sq   = Board.index_to_square(nr, nc)
-        if cell == ' ':
-            # Casa vazia → entrar em Modo 2
-            exit_results.append((sq, _enter_king_mode(state, dest), 1.0))
-        elif cell in WHITE_PIECES:
-            # Peça branca adjacente → activar directamente (1 acção total)
-            intermediate = _enter_king_mode(state, dest)
-            new_state    = _activate_piece(intermediate, dest, cell)
-            # Forçar move_count = original + 1 (evita dupla contagem)
-            new_state    = replace(new_state, move_count=state.move_count + 1)
-            exit_results.append((sq, new_state, 1.0))
+        if _cell_at(state, nr, nc) == ' ':
+            sq = Board.index_to_square(nr, nc)
+            exit_results.append((sq, _enter_king_mode(state, (nr, nc)), 1.0))
 
     exit_results.sort(key=_succ_key)
     return exit_results
@@ -275,8 +262,6 @@ def solve_board(board, time_limit_ms):
         return node
 
     # Fase 2: A* exaustivo — prova impossibilidade (fila vazia) ou acha solução
-    # Para instâncias impossíveis (ex: inst 8), o A* explora todo o espaço
-    # finito e devolve None → solution_string devolve '' (solução vazia)
     return astar(
         initial_state,
         is_goal=is_goal,
