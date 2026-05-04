@@ -5,19 +5,25 @@ from dataclasses import replace
 try:
     from search.algorithms import astar, greedy_search
     from chess_pawn_mower.board import Board
-    from chess_pawn_mower.moves import WHITE_PIECES, capture_targets, king_step_targets
+    from chess_pawn_mower.moves import WHITE_PIECES, capture_targets
     from chess_pawn_mower.state import PawnMowerState
 except (ModuleNotFoundError, ImportError):
     from algorithms import astar, greedy_search  # type: ignore
     from board import Board  # type: ignore
-    from moves import WHITE_PIECES, capture_targets, king_step_targets  # type: ignore
+    from moves import WHITE_PIECES, capture_targets  # type: ignore
     from state import PawnMowerState  # type: ignore
 
 MAX_ACTIONS = 100
-_MST_CACHE = {}
-_NEAREST_CACHE = {}
-KING_DELTAS = ((-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1))
+_MST_CACHE  = {}
 
+KING_DELTAS = (
+    (-1, -1), (-1, 0), (-1, 1),
+    ( 0, -1),          ( 0, 1),
+    ( 1, -1), ( 1, 0), ( 1, 1),
+)
+
+
+# ── Estado inicial ───────────────────────────────────────────────────────────
 
 def build_initial_state(board):
     return PawnMowerState(
@@ -31,9 +37,13 @@ def build_initial_state(board):
     )
 
 
+# ── Objectivo ────────────────────────────────────────────────────────────────
+
 def is_goal(state):
     return not state.remaining_black_pawns
 
+
+# ── Heurística (MST de Chebyshev) ────────────────────────────────────────────
 
 def _chebyshev(a, b):
     return max(abs(a[0] - b[0]), abs(a[1] - b[1]))
@@ -62,12 +72,10 @@ def _mst_cost(points):
         dist[i] = _chebyshev(pts[0], pts[i])
     total = 0.0
     for _ in range(n - 1):
-        best_i = -1
-        best_d = float('inf')
+        best_i, best_d = -1, float('inf')
         for i in range(n):
             if not used[i] and dist[i] < best_d:
-                best_d = dist[i]
-                best_i = i
+                best_d, best_i = dist[i], i
         if best_i == -1:
             break
         used[best_i] = True
@@ -81,50 +89,40 @@ def _mst_cost(points):
     return total
 
 
-def _nearest_pawn_distance(state):
-    key = (state.active_position, state.king_position, state.remaining_black_pawns)
-    cached = _NEAREST_CACHE.get(key)
-    if cached is not None:
-        return cached
+def heuristic(state):
     pawns = state.remaining_black_pawns
     if not pawns:
-        _NEAREST_CACHE[key] = 0
-        return 0
-    pos = state.active_position if state.active_position is not None else state.king_position
-    if pos is not None:
-        value = min(_chebyshev(pos, p) for p in pawns)
-    else:
-        whites = [(r, c) for r, c, _ in _all_white_positions(state.board)]
-        value = min((_chebyshev(w, p) for w in whites for p in pawns), default=0)
-    _NEAREST_CACHE[key] = value
-    return value
-
-
-def heuristic(state):
-    pawns = tuple(state.remaining_black_pawns)
-    if not pawns:
         return 0.0
-    mst = _mst_cost(pawns)
-    pos = state.active_position if state.active_position is not None else state.king_position
+    mst = _mst_cost(tuple(pawns))
+    pos = (state.active_position
+           if state.active_position is not None
+           else state.king_position)
     if pos is not None:
-        return mst + min(_chebyshev(pos, p) for p in pawns)
+        return float(mst + min(_chebyshev(pos, p) for p in pawns))
     whites = [(r, c) for r, c, _ in _all_white_positions(state.board)]
     nearest = min((_chebyshev(w, p) for w in whites for p in pawns), default=0.0)
-    return mst + nearest + 1.0
+    return float(mst + nearest + 1.0)
 
+
+# ── Célula efectiva (considera estado dinâmico) ──────────────────────────────
 
 def _cell_at(state, row, col):
-    position = (row, col)
-    if position == state.king_position:
+    pos = (row, col)
+    # CRÍTICO: guard is not None antes de comparar com king_position
+    if state.king_position is not None and pos == state.king_position:
         return 'R'
-    if position == state.active_position and state.active_piece is not None:
+    if state.active_piece is not None and pos == state.active_position:
         return state.active_piece
-    if position in state.remaining_black_pawns:
+    if pos in state.remaining_black_pawns:
         return 'p'
-    if position == state.active_origin_position and state.active_position != state.active_origin_position:
+    if (state.active_origin_position is not None
+            and pos == state.active_origin_position
+            and state.active_position != state.active_origin_position):
         return ' '
     return state.board.get(row, col)
 
+
+# ── Transições de estado ──────────────────────────────────────────────────────
 
 def _activate_piece(state, position, symbol):
     return replace(
@@ -138,10 +136,16 @@ def _activate_piece(state, position, symbol):
 
 
 def _capture_with_active(state, destination):
+    # CRÍTICO: actualizar active_origin_position para o destino da captura.
+    # Sem isto, a casa de origem original continua a aparecer como vazia
+    # em _cell_at, gerando acções inválidas nas capturas seguintes.
     return replace(
         state,
         active_position=destination,
-        remaining_black_pawns=frozenset(p for p in state.remaining_black_pawns if p != destination),
+        active_origin_position=destination,
+        remaining_black_pawns=frozenset(
+            p for p in state.remaining_black_pawns if p != destination
+        ),
         move_count=state.move_count + 1,
     )
 
@@ -160,83 +164,134 @@ def _move_king_step(state, destination):
     return replace(state, king_position=destination, move_count=state.move_count + 1)
 
 
-def _succ_key(item):
-    action, nxt, _ = item
-    return (
-        len(nxt.remaining_black_pawns),
-        _nearest_pawn_distance(nxt),
-        nxt.move_count,
-        action,
-    )
+# ── Ordenação dos sucessores pela heurística MST completa ────────────────────
 
+def _succ_key(item):
+    _, nxt, _ = item
+    return heuristic(nxt)
+
+
+# ── Sucessores ────────────────────────────────────────────────────────────────
 
 def successors(state):
     if state.move_count >= MAX_ACTIONS or is_goal(state):
         return []
 
     board = state.board
-    results = []
 
-    if state.active_piece is None and state.active_position is None and state.king_position is None:
-        whites = list(_all_white_positions(board))
-        whites.sort(key=lambda t: min((_chebyshev((t[0], t[1]), p) for p in state.remaining_black_pawns), default=0))
-        for row, col, symbol in whites:
+    # ── MODO 0: activar uma peça branca do tabuleiro ─────────────────────────
+    if state.active_piece is None and state.king_position is None:
+        results = []
+        for row, col, symbol in _all_white_positions(board):
             sq = Board.index_to_square(row, col)
             results.append((sq, _activate_piece(state, (row, col), symbol), 1.0))
-        return results
-
-    if state.king_position is not None:
-        row, col = state.king_position
-        for d_row, d_col in KING_DELTAS:
-            nr, nc = row + d_row, col + d_col
-            if not board.in_bounds(nr, nc):
-                continue
-            cell = _cell_at(state, nr, nc)
-            sq = Board.index_to_square(nr, nc)
-            if cell == ' ':
-                results.append((sq, _move_king_step(state, (nr, nc)), 1.0))
-            elif cell in WHITE_PIECES and cell != 'R':
-                results.append((sq, _activate_piece(state, (nr, nc), cell), 1.0))
         results.sort(key=_succ_key)
         return results
 
+    # ── MODO 2: drone em modo rei (a andar entre peças) ───────────────────────
+    if state.king_position is not None:
+        results = []
+        row_k, col_k = state.king_position
+        for d_row, d_col in KING_DELTAS:
+            nr, nc = row_k + d_row, col_k + d_col
+            if not board.in_bounds(nr, nc):
+                continue
+            dest = (nr, nc)
+            cell = _cell_at(state, nr, nc)
+            sq   = Board.index_to_square(nr, nc)
+            if cell == ' ':
+                results.append((sq, _move_king_step(state, dest), 1.0))
+            elif cell in WHITE_PIECES:
+                # CORRIGIDO: sem "cell != 'R'" — Torres do board são 'R'
+                # e devem ser activáveis. O rei dinâmico está em
+                # king_position e nunca aparece numa casa adjacente.
+                results.append((sq, _activate_piece(state, dest, cell), 1.0))
+        results.sort(key=_succ_key)
+        return results
+
+    # ── MODO 1: peça activa tenta capturar ────────────────────────────────────
     if state.active_piece is None or state.active_position is None:
         return []
 
+    cell_fn = lambda r, c: _cell_at(state, r, c)
+    apos = state.active_position
+
     captures = []
-    for row, col in capture_targets(board, state.active_position, state.active_piece, cell_at=lambda r, c: _cell_at(state, r, c)):
-        if (row, col) in state.remaining_black_pawns:
+    for row, col in capture_targets(board, apos, state.active_piece, cell_at=cell_fn):
+        dest = (row, col)
+        if dest in state.remaining_black_pawns:
             sq = Board.index_to_square(row, col)
-            captures.append((sq, _capture_with_active(state, (row, col)), 1.0))
+            captures.append((sq, _capture_with_active(state, dest), 1.0))
+
     if captures:
         captures.sort(key=_succ_key)
         return captures
 
-    king_results = []
-    for row, col in king_step_targets(board, state.active_position, cell_at=lambda r, c: _cell_at(state, r, c)):
-        if _cell_at(state, row, col) == ' ':
-            sq = Board.index_to_square(row, col)
-            king_results.append((sq, _enter_king_mode(state, (row, col)), 1.0))
-    king_results.sort(key=_succ_key)
-    return king_results
+    # Sem capturas: sair da peça activa (1 passo de rei adjacente)
+    exit_results = []
+    row_a, col_a = apos
+    for d_row, d_col in KING_DELTAS:
+        nr, nc = row_a + d_row, col_a + d_col
+        if not board.in_bounds(nr, nc):
+            continue
+        dest = (nr, nc)
+        cell = _cell_at(state, nr, nc)
+        sq   = Board.index_to_square(nr, nc)
+        if cell == ' ':
+            # Casa vazia → entrar em Modo 2
+            exit_results.append((sq, _enter_king_mode(state, dest), 1.0))
+        elif cell in WHITE_PIECES:
+            # Peça branca adjacente → activar directamente (1 acção total)
+            intermediate = _enter_king_mode(state, dest)
+            new_state    = _activate_piece(intermediate, dest, cell)
+            # Forçar move_count = original + 1 (evita dupla contagem)
+            new_state    = replace(new_state, move_count=state.move_count + 1)
+            exit_results.append((sq, new_state, 1.0))
 
+    exit_results.sort(key=_succ_key)
+    return exit_results
+
+
+# ── Resolução ─────────────────────────────────────────────────────────────────
 
 def solve_board(board, time_limit_ms):
     initial_state = build_initial_state(board)
     if time_limit_ms is None:
-        greedy_time = None
-        astar_time = None
+        greedy_time = astar_time = None
     else:
-        greedy_time = max(1, int(time_limit_ms * 0.7))
-        astar_time = max(1, time_limit_ms - greedy_time)
+        greedy_time = max(1, int(time_limit_ms * 0.85))
+        astar_time  = max(1, time_limit_ms - greedy_time)
 
-    node = greedy_search(initial_state, is_goal=is_goal, successors=successors, heuristic=heuristic, time_limit_ms=greedy_time, max_nodes=3_000_000)
+    # Fase 1: greedy — resolve instâncias possíveis rapidamente
+    node = greedy_search(
+        initial_state,
+        is_goal=is_goal,
+        successors=successors,
+        heuristic=heuristic,
+        time_limit_ms=greedy_time,
+        max_nodes=8_000_000,
+    )
     if node is not None:
         return node
-    return astar(initial_state, is_goal=is_goal, successors=successors, heuristic=heuristic, time_limit_ms=astar_time, max_nodes=1_500_000)
 
+    # Fase 2: A* exaustivo — prova impossibilidade (fila vazia) ou acha solução
+    # Para instâncias impossíveis (ex: inst 8), o A* explora todo o espaço
+    # finito e devolve None → solution_string devolve '' (solução vazia)
+    return astar(
+        initial_state,
+        is_goal=is_goal,
+        successors=successors,
+        heuristic=heuristic,
+        time_limit_ms=astar_time,
+        max_nodes=2_000_000,
+    )
+
+
+# ── Solução em string ─────────────────────────────────────────────────────────
 
 def solution_string(node):
     if node is None:
         return ''
-    return ' '.join(str(step.action) for step in node.path()[1:] if step.action is not None)
+    return ' '.join(
+        str(step.action) for step in node.path()[1:] if step.action is not None
+    )
