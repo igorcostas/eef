@@ -1,0 +1,588 @@
+USE [PalmelaPlant_GEN5_EOLTesters]
+GO
+/****** Object:  StoredProcedure [dbo].[sp_SysAdmin_SyncData_Results]    Script Date: 05/08/2026 11:07:33 ******/
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+
+
+
+
+
+
+
+-- =============================================
+-- Author:		André Nunes
+-- Create date: 2025-10-24
+-- Description:	Synchronizes a batch of Result data with one of the EOL Tester stations.
+-- Modified (<date> <resp.>): 
+
+-- =============================================
+
+ALTER PROCEDURE [dbo].[sp_SysAdmin_SyncData_Results] 
+				 @stationID INT,
+				 @remoteServer NVARCHAR(100),
+				 @stationDB NVARCHAR(20),
+				 @maxRecords INT = 10,
+				 @verboseMode BIT = 0
+
+AS
+BEGIN
+	-- SET NOCOUNT ON added to prevent extra result sets from
+	-- interfering with SELECT statements.
+	SET NOCOUNT ON;
+
+	DECLARE @version AS NVARCHAR(10) = 'v1.0.0';			 --Procedure version
+	DECLARE @procedure NVARCHAR(50) = OBJECT_NAME(@@PROCID); --Get Stored Procedure name
+
+	DECLARE @scripRunTime DATETIME = GETDATE();
+	DECLARE @scripRunTimeTmp DATETIME = GETDATE();
+
+	DECLARE @remoteDB AS NVARCHAR(60) = QUOTENAME(@remoteServer) + '.' + QUOTENAME(@stationDB) + '.[dbo].';
+	DECLARE @runTime INT;
+    
+	DECLARE @logMessage NVARCHAR(MAX);
+	DECLARE @sqlCmd AS NVARCHAR(MAX);
+	DECLARE @errorFlag BIT = 0;
+
+	DECLARE @logLabel2 AS NVARCHAR(10) = 'SyncData';
+	DECLARE @logLabel3 AS NVARCHAR(10) = 'Results';
+	
+	
+    BEGIN TRY
+
+		DECLARE @syncedRows INT = 0;
+		DECLARE @firstRemoteSyncID BIGINT = 0;
+		DECLARE @firstLocalSyncID BIGINT = 0;
+
+
+		DECLARE @resultData TABLE(
+			[RemoteSyncID] BIGINT,
+			[RemoteResultID] BIGINT,		
+			[RemoteProgramID] BIGINT,			
+			[SerialNumber] VARCHAR(20),
+			[PartNumber] VARCHAR(20),
+			[SWVersion] VARCHAR(10),
+			[CustSWVersion] VARCHAR(10),
+			[CustHWVersion] VARCHAR(10),
+			[Result] BIT,
+			[CycleTime] REAL,
+			[Timestamp] DATETIME,
+			[Nest_Number] TINYINT);
+
+
+		DECLARE @detailData TABLE(
+			[RemoteDetailID] BIGINT,
+			[RemoteResultID] BIGINT,
+			[RemoteSequenceID] BIGINT,		
+			[Result] BIT,
+			[Value] REAL,
+			[CycleTime] INT);
+					
+
+		DECLARE @syncedResults TABLE(
+			[RemoteSyncID] BIGINT,
+			[RemoteResultID] BIGINT,
+			[ResultID] BIGINT,
+			[ProgramID] BIGINT);
+
+
+		DECLARE @syncedDetails TABLE(
+			[DetailID] BIGINT);
+
+
+		DECLARE @localSyncList TABLE(
+			[LocalSyncID] BIGINT);
+		
+
+		PRINT '';
+		PRINT 'Starting [' + @procedure + ']';
+
+		IF @verboseMode = 1
+		BEGIN
+			SET @logMessage = 'Synchronization process started for ' + QUOTENAME(@remoteServer) + '.' + QUOTENAME(@stationDB) + ' (' + @version + ').';
+			EXEC sp_SysAdmin_InsertLog @procedure, 'Info', @logLabel2, @logLabel3, @stationID, @logMessage;
+		END
+
+		-- Get Result data (Result and Detail tables) from remote DB main tables based on unsynced data list
+		-- Use Staging table and process data at remote DB -> Improves processing time
+		-- Search main tables only when there is unsynced data -> Improves processing time
+		-- Select only Results with timestamp at least 1 minute old -> To make sure all corresponding Detail rows are updated
+		SET @sqlCmd =
+		'EXEC (''
+		USE ' + QUOTENAME(@stationDB) + ';
+
+		TRUNCATE TABLE [SysAdmin_Staging_UnsyncedResults];
+		TRUNCATE TABLE [SysAdmin_Staging_UnsyncedDetails];
+
+		IF EXISTS (SELECT 1 FROM [SysAdmin_SyncResults] WHERE [IsSynced] = 0 AND [Result_Timestamp] < DATEADD(MINUTE, -1, GETDATE()))
+		BEGIN
+			-- Insert unsynced Results into Staging table 
+			INSERT INTO [SysAdmin_Staging_UnsyncedResults] (
+				 [SyncID]
+				,[Result_Index]
+				,[Program_Index]
+				,[SerialNumber]
+				,[PartNumber]
+				,[SWVersion]
+				,[CustSWVersion]
+				,[CustHWVersion]
+				,[Result]
+				,[CycleTime]
+				,[Timestamp]
+				,[Nest_Number])
+			SELECT TOP(' + CAST(@maxRecords AS NVARCHAR) + ') 
+				U.[SyncID],
+				U.[Result_Index],
+				R.[Program_Index],
+				R.[SerialNumber],
+				R.[PartNumber],
+				R.[SWVersion],
+				R.[CustSWVersion],
+				R.[CustHWVersion],
+				R.[Result],
+				R.[CycleTime],
+				R.[Timestamp],
+				R.[Nest_Number]
+			FROM [SysAdmin_SyncResults] U
+			INNER JOIN [Result] R ON R.[Index] = U.[Result_Index] 
+			WHERE
+			U.[IsSynced] = 0 AND
+			U.[Result_Timestamp] < DATEADD(MINUTE, -1, GETDATE()) 
+			OPTION (RECOMPILE);
+
+			-- Insert Details associated with unsynced Results into Staging table 
+			INSERT INTO [SysAdmin_Staging_UnsyncedDetails] (
+				 [SyncID]
+				,[Detail_Index]
+				,[Result_Index]
+				,[Sequence_Index]
+				,[Result]
+				,[Value]
+				,[CycleTime])
+			SELECT 
+				U.[SyncID],
+				D.[Index],
+				U.[Result_Index],
+				D.[TestSequence_Index],
+				D.[Result],
+				D.[Value],
+				D.[CycleTime]
+			FROM [SysAdmin_Staging_UnsyncedResults] U
+			INNER JOIN [Detail] D ON D.[Result_Index] = U.[Result_Index]
+			OPTION (RECOMPILE);
+		END'') AT ' + QUOTENAME(@remoteServer) + ';';
+
+		EXEC sp_executesql @sqlCmd;
+
+		--Intermediate runtime
+		SET @runTime = DATEDIFF(millisecond, @scripRunTimeTmp, GETDATE());
+		PRINT 'Step runtime (staging data at remote DB side): ' + CAST(@runTime AS NVARCHAR) + ' ms';
+		SET @scripRunTimeTmp = GETDATE();
+
+		IF @verboseMode = 1
+		BEGIN
+			SET @logMessage = 'Staging unsynced data on remote DB took ' + CAST(@runTime AS NVARCHAR) + ' ms.';
+			EXEC sp_SysAdmin_InsertLog @procedure, 'Info', @logLabel2, @logLabel3, @stationID, @logMessage;
+		END
+	
+		
+		DECLARE @syncID BIGINT = NULL;
+
+		-- Get Result (header) data from remote Staging table
+		--> To test if there are records to sync
+		SET @sqlCmd = 
+		'SELECT TOP(1) @syncIDOUT = [SyncID] FROM ' + @remoteDB + '[SysAdmin_Staging_UnsyncedResults];';
+
+		EXEC sp_executesql @sqlCmd, N'@syncIDOUT BIGINT OUTPUT', 
+								    @syncIDOUT = @syncID OUTPUT;
+
+
+		-- If there are Results to sync -> Start copying data to Local Server
+		IF @syncID IS NOT NULL
+		BEGIN
+			--Get Result (header) data from remote Staging table
+			SET @sqlCmd = 
+			'SELECT 
+				 [SyncID]
+				,[Result_Index]
+				,[Program_Index]
+				,[SerialNumber]
+				,[PartNumber]
+				,[SWVersion]
+				,[CustSWVersion]
+				,[CustHWVersion]
+				,[Result]
+				,[CycleTime]
+				,[Timestamp]
+				,[Nest_Number] FROM ' + @remoteDB + '[SysAdmin_Staging_UnsyncedResults];';
+
+			INSERT INTO @resultData (	
+				[RemoteSyncID],
+				[RemoteResultID],
+				[RemoteProgramID],
+				[SerialNumber],
+				[PartNumber],
+				[SWVersion],
+				[CustSWVersion],
+				[CustHWVersion],
+				[Result],
+				[CycleTime],
+				[Timestamp],
+				[Nest_Number])
+
+			EXEC sp_executesql @sqlCmd;
+
+
+			--Get Result (detail) data from remote Staging table
+			SET @sqlCmd = 
+			'SELECT 
+				 [Detail_Index]
+				,[Result_Index]
+				,[Sequence_Index]
+				,[Result]
+				,[Value]
+				,[CycleTime] FROM ' + @remoteDB + '[SysAdmin_Staging_UnsyncedDetails];';
+
+			INSERT INTO @detailData (	
+				[RemoteDetailID],
+				[RemoteResultID],
+				[RemoteSequenceID],		
+				[Result],
+				[Value],
+				[CycleTime])
+
+			EXEC sp_executesql @sqlCmd;
+		END
+
+		--Intermediate runtime
+		SET @runTime = DATEDIFF(millisecond, @scripRunTimeTmp, GETDATE());
+		PRINT 'Step runtime (fetch data): ' + CAST(@runTime AS NVARCHAR) + ' ms';
+		SET @scripRunTimeTmp = GETDATE();
+
+		IF @verboseMode = 1
+		BEGIN
+			SET @logMessage = 'Fetching (copying) unsynced data from remote DB took ' + CAST(@runTime AS NVARCHAR) + ' ms.';
+			EXEC sp_SysAdmin_InsertLog @procedure, 'Info', @logLabel2, @logLabel3, @stationID, @logMessage;
+		END
+
+		--If there is data to be synced
+		IF EXISTS (SELECT 1 FROM @resultData)
+		BEGIN
+
+			BEGIN TRY
+				BEGIN TRANSACTION;
+
+				-- Insert new Result (header) data into [Results] table
+				-- Match the newly created ResultIDs with SyncIDs into @syncedResults table 
+				-- Search local ProgramID based on RemoteProgramID and StationID 
+				--> Select just the last ProgramID that fits RemoteProgramID and stationID 
+				---> In case there are more than one due to an incomplete sync run
+				-- MERGE is used because it allows data from SOURCE to be included in OUTPUT statement (even when this data is not actually inserted into TARGET)
+				--> We need "RemoteSyncID"
+				MERGE INTO [Results] AS Target
+				USING (
+					SELECT 
+						R.[RemoteSyncID],
+						R.[RemoteResultID],
+						P.[ProgramID],
+						R.[SerialNumber],
+						R.[PartNumber],
+						R.[SWVersion],
+						R.[CustSWVersion],
+						R.[CustHWVersion],
+						R.[Result],
+						R.[CycleTime],
+						R.[Timestamp],
+						R.[Nest_Number]
+					FROM @resultData R				
+					OUTER APPLY (
+						SELECT TOP(1) [ProgramID]
+						FROM [Programs] P
+						WHERE 
+						P.[RemoteProgramID] = R.[RemoteProgramID] AND 
+						P.[StationID] = @stationID
+						ORDER BY P.[ProgramID] DESC
+					) P
+				) AS Source
+				ON 1 = 0  -- forces INSERT for every row
+				WHEN NOT MATCHED THEN
+					INSERT (
+						[StationID],
+						[RemoteResultID],
+						[ProgramID],
+						[SerialNumber],
+						[PartNumber],
+						[SWVersion],
+						[CustSWVersion],
+						[CustHWVersion],
+						[Result],
+						[CycleTime],
+						[Timestamp],
+						[Nest_Number]
+					)
+					VALUES (
+						@stationID,
+						Source.[RemoteResultID],
+						Source.[ProgramID],
+						Source.[SerialNumber],
+						Source.[PartNumber],
+						Source.[SWVersion],
+						Source.[CustSWVersion],
+						Source.[CustHWVersion],
+						Source.[Result],
+						Source.[CycleTime],
+						Source.[Timestamp],
+						Source.[Nest_Number]
+					)
+					OUTPUT 
+						Source.[RemoteSyncID],
+						INSERTED.[RemoteResultID],
+						INSERTED.[ResultID],
+						INSERTED.[ProgramID]
+					INTO @syncedResults (
+						[RemoteSyncID], 
+						[RemoteResultID], 
+						[ResultID], 
+						[ProgramID]);
+
+
+				-- Insert new Result (detail) data into [Details] table
+				-- Match each record with the correct ResultID (newly created in the previous step)
+				-- Search for corresponding SequenceID from [TestSequences] table
+				-- Save the newly created DetailIDs into @syncedDetails table 
+				INSERT INTO [Details] (	
+					 [ResultID]
+					,[SequenceID]
+					,[RemoteDetailID]
+					,[Result]
+					,[Value]
+					,[CycleTime])
+				OUTPUT 
+					INSERTED.[DetailID] 
+				INTO @syncedDetails ([DetailID])
+
+				SELECT 
+					R.[ResultID],
+					T.[SequenceID],
+					D.[RemoteDetailID],
+					D.[Result],
+					D.[Value],
+					D.[CycleTime]
+				FROM @detailData D
+				INNER JOIN @syncedResults R ON R.[RemoteResultID] = D.[RemoteResultID]
+				INNER JOIN [TestSequences] T ON (T.[ProgramID] = R.[ProgramID] AND T.[RemoteSequenceID] = D.[RemoteSequenceID])
+
+
+				--Intermediate runtime
+				SET @runTime = DATEDIFF(millisecond, @scripRunTimeTmp, GETDATE());
+				PRINT 'Step runtime (inserting Result and Detail data): ' + CAST(@runTime AS NVARCHAR) + ' ms';
+				SET @scripRunTimeTmp = GETDATE();
+
+				IF @verboseMode = 1
+				BEGIN
+					SET @logMessage = 'Inserting data into local DB took ' + CAST(@runTime AS NVARCHAR) + ' ms.';
+					EXEC sp_SysAdmin_InsertLog @procedure, 'Info', @logLabel2, @logLabel3, @stationID, @logMessage;
+				END
+
+
+				-- Insert synced data list into local SyncResults table
+				-- Save newly created SyncIDs for saving the first one to Log
+				INSERT INTO [SysAdmin_SyncResults] (
+					[StationID],
+					[RemoteSyncID],
+					[RemoteResultID],
+					[ResultID])
+				OUTPUT 
+					INSERTED.[SyncID]
+				INTO @localSyncList ([LocalSyncID])
+
+				SELECT 
+					@stationID,
+					[RemoteSyncID],
+					[RemoteResultID],
+					[ResultID]
+				FROM @syncedResults;
+
+				-- Commit transaction
+				COMMIT TRANSACTION;
+
+				--Intermediate runtime
+				SET @runTime = DATEDIFF(millisecond, @scripRunTimeTmp, GETDATE());
+				PRINT 'Step runtime (insert into local sync table): ' + CAST(@runTime AS NVARCHAR) + ' ms';
+				SET @scripRunTimeTmp = GETDATE();
+
+				IF @verboseMode = 1
+				BEGIN
+					SET @logMessage = 'Inserting data into local Sync table took ' + CAST(@runTime AS NVARCHAR) + ' ms.';
+					EXEC sp_SysAdmin_InsertLog @procedure, 'Info', @logLabel2, @logLabel3, @stationID, @logMessage;
+				END
+		
+			END TRY
+			BEGIN CATCH
+				SET @errorFlag = 1;
+
+				-- Rollback in case of an error
+				ROLLBACK TRANSACTION;
+
+				PRINT 'Exception at [' + @procedure + ']';
+				PRINT 'Exception copying to Main DB -> Rolling back.';
+				PRINT 'Exception number: ' + CAST(ERROR_NUMBER() AS VARCHAR);
+				PRINT 'Exception message: "' + ERROR_MESSAGE() + '"';
+		
+				SET @logMessage = 'Exception copying to Main DB -> Rolling back (exception number ' + CAST(ERROR_NUMBER() AS VARCHAR) + ' "' + ERROR_MESSAGE() + '").';
+				EXEC sp_SysAdmin_InsertLog @procedure, 'Exception', @logLabel2, @logLabel3, @stationID, @logMessage;
+        
+				PRINT 'Failed to transfer data from Linked Server. Remote Sync table not updated.';
+			END CATCH
+
+
+			--If there was no error -> Update Sync table on remote DB
+			IF @errorFlag = 0
+			BEGIN
+				
+				PRINT 'Converting SyncData to Staging Table...';
+				-- Use unique Job identifier so that the staging table can be used by more than one job at the same time
+				DECLARE @jobID UNIQUEIDENTIFIER = NEWID();
+
+				-- Clean up old data in Statging Table -> Older than 10 minutes
+				DELETE FROM SysAdmin_Staging_SyncedResults WHERE [Created] < DATEADD(MINUTE, -10, GETDATE());
+
+				-- Insert sync data from @syncedResults table into Staging_SyncedResults table
+				--> Use unique Job identifier so that the table can be used by more than one job at the same time
+				INSERT INTO SysAdmin_Staging_SyncedResults (
+					[JobID],
+					[RemoteSyncID],
+					[RemoteResultID],
+					[ResultID])
+				SELECT 
+					@jobID, 
+					[RemoteSyncID], 
+					[RemoteResultID],
+					[ResultID]
+				FROM @syncedResults;
+
+				--Intermediate runtime
+				SET @runTime = DATEDIFF(millisecond, @scripRunTimeTmp, GETDATE());
+				PRINT 'Step runtime (inserting into local staging synced table): ' + CAST(@runTime AS NVARCHAR) + ' ms';
+				SET @scripRunTimeTmp = GETDATE();
+
+				IF @verboseMode = 1
+				BEGIN
+					SET @logMessage = 'Inserting data into local staging Synced table took ' + CAST(@runTime AS NVARCHAR) + ' ms.';
+					EXEC sp_SysAdmin_InsertLog @procedure, 'Info', @logLabel2, @logLabel3, @stationID, @logMessage;
+				END
+
+				-- Update remote Sync table for all successfully synced data
+				-- Uses a Staging Table on remote DB to make UPDATE process faster -> It runs much faster than with a direct UPDATE managed from Main Server
+				-- Separate Delete command from Insert so that Delete can run in the remote DB -> For faster processing
+				--> Deletes prepares remote Staging table for receiving the newly synced IDs
+				SET @sqlCmd =
+				'EXEC (''USE ' + QUOTENAME(@stationDB) + ';
+						
+						 DELETE FROM [SysAdmin_Staging_SyncedResults];'') AT ' + QUOTENAME(@remoteServer) + ';';
+
+				EXEC sp_executesql @sqlCmd;
+
+				--Intermediate runtime
+				SET @runTime = DATEDIFF(millisecond, @scripRunTimeTmp, GETDATE());
+				PRINT 'Step runtime (Deleting remote staging synced table): ' + CAST(@runTime AS NVARCHAR) + ' ms';
+				SET @scripRunTimeTmp = GETDATE();
+
+				IF @verboseMode = 1
+				BEGIN
+					SET @logMessage = 'Deleting old data from remote staging Synced table took ' + CAST(@runTime AS NVARCHAR) + ' ms.';
+					EXEC sp_SysAdmin_InsertLog @procedure, 'Info', @logLabel2, @logLabel3, @stationID, @logMessage;
+				END
+
+				SET @sqlCmd =
+				'INSERT INTO ' + @remoteDB + '[SysAdmin_Staging_SyncedResults]
+				SELECT [RemoteSyncID] 
+				FROM SysAdmin_Staging_SyncedResults 
+				WHERE JobID = @jobID;';
+
+				EXEC sp_executesql @sqlCmd, N'@jobID UNIQUEIDENTIFIER', @jobID;
+
+				--Intermediate runtime
+				SET @runTime = DATEDIFF(millisecond, @scripRunTimeTmp, GETDATE());
+				PRINT 'Step runtime (Insert remote staging synced table): ' + CAST(@runTime AS NVARCHAR) + ' ms';
+				SET @scripRunTimeTmp = GETDATE();
+
+				IF @verboseMode = 1
+				BEGIN
+					SET @logMessage = 'Inserting data into remote staging Synced table took ' + CAST(@runTime AS NVARCHAR) + ' ms.';
+					EXEC sp_SysAdmin_InsertLog @procedure, 'Info', @logLabel2, @logLabel3, @stationID, @logMessage;
+				END
+
+				-- Update remote SyncResults table -> Changing IsSynced to 1
+				SET @sqlCmd =
+				'EXEC (''USE ' + QUOTENAME(@stationDB) + ';
+						
+						UPDATE T
+						SET T.IsSynced = 1
+						FROM [SysAdmin_SyncResults] T
+						JOIN [SysAdmin_Staging_SyncedResults] S ON S.SyncID = T.SyncID'') AT ' + QUOTENAME(@remoteServer) + ';';
+
+				EXEC sp_executesql @sqlCmd;
+
+				--Intermediate runtime
+				SET @runTime = DATEDIFF(millisecond, @scripRunTimeTmp, GETDATE());
+				PRINT 'Step runtime (Update remote Sync table): ' + CAST(@runTime AS NVARCHAR) + ' ms';
+				SET @scripRunTimeTmp = GETDATE();
+
+				IF @verboseMode = 1
+				BEGIN
+					SET @logMessage = 'Updating remote Sync table took ' + CAST(@runTime AS NVARCHAR) + ' ms.';
+					EXEC sp_SysAdmin_InsertLog @procedure, 'Info', @logLabel2, @logLabel3, @stationID, @logMessage;
+				END
+
+				-- Clean up data in local Statging table
+				DELETE FROM SysAdmin_Staging_SyncedResults WHERE [JobID] = @jobID;
+			END
+
+			-- Update number of synced Results and first SyncIDs for reference
+			SELECT @syncedRows = COUNT(*) FROM @syncedResults;
+			SELECT @firstRemoteSyncID = MIN([RemoteSyncID]) FROM @syncedResults;
+			SELECT @firstLocalSyncID = MIN([LocalSyncID]) FROM @localSyncList;
+
+		END
+		ELSE
+		BEGIN
+			PRINT 'No data to be synced.';
+			IF @verboseMode = 1
+			BEGIN
+				SET @logMessage = 'No data to be synced.';
+				EXEC sp_SysAdmin_InsertLog @procedure,'Info', @logLabel2, @logLabel3, @stationID, @logMessage;
+			END
+		END
+	
+		SET @logMessage = 'Synchronization ended in ' + CAST((DATEDIFF(millisecond, @scripRunTime, GETDATE())) AS NVARCHAR) + ' ms.';
+		EXEC sp_SysAdmin_InsertLog @procedure,'Result', @logLabel2, @logLabel3, @stationID, @logMessage, @firstLocalSyncID, @firstRemoteSyncID, @syncedRows;
+        
+    END TRY
+    BEGIN CATCH
+		SET @errorFlag = 1;
+
+		PRINT 'Exception at [' + @procedure + ']';
+		PRINT 'Exception copying from Remote DB.';
+		PRINT 'Exception number: ' + CAST(ERROR_NUMBER() AS VARCHAR);
+		PRINT 'Exception message: "' + ERROR_MESSAGE() + '"';
+
+        SET @logMessage = 'Exception while syncing data with Linked Server (' + ERROR_MESSAGE() + ').';
+		EXEC sp_SysAdmin_InsertLog @procedure, 'Exception', @logLabel2, @logLabel3, @stationID, @logMessage;
+        
+        PRINT 'Failed to transfer data from Linked Server. Remote Sync table not updated.';
+    END CATCH;
+
+	--Update Procedures table with running information -> Meant to avoid Log overflow
+	SET @runTime = DATEDIFF(millisecond, @scripRunTime, GETDATE());
+
+	EXEC sp_SysAdmin_UpdateProcedure @procedure, @runTime, @errorFlag, @version;
+
+
+	PRINT '';
+	PRINT 'Total run time (ms): ' + CAST(@runTime AS NVARCHAR);
+
+	PRINT '[' + @procedure + '] done.';
+END;
